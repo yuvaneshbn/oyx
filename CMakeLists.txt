@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 project(voice_two_way LANGUAGES C CXX)
 
 if (POLICY CMP0144)
@@ -14,8 +14,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(VOICE_BUILD_CLIENT "Build voice client" ON)
-option(VOICE_BUILD_SERVER "Build voice server" ON)
 option(VOICE_BUILD_AUDIO_NATIVE "Build native_mixer audio module" OFF)
+option(VOICE_RUN_QT_DEPLOY "Run windeployqt after building the Windows client" ON)
 
 if (MINGW AND VOICE_BUILD_AUDIO_NATIVE)
     message(WARNING "MinGW toolchains often fail to build the bundled AEC3; disabling VOICE_BUILD_AUDIO_NATIVE.")
@@ -65,6 +65,7 @@ else()
 endif()
 
 add_library(voice_shared STATIC
+    shared/audio_packet.cpp
     shared/opus_codec.cpp
     shared/socket_utils.cpp
     shared/winsock_init.cpp
@@ -78,11 +79,8 @@ endif()
 
 if (VOICE_BUILD_CLIENT)
     find_package(Qt6 REQUIRED COMPONENTS Widgets UiTools)
+find_package(webrtc-audio-processing CONFIG REQUIRED)
     add_subdirectory(client)
-endif()
-
-if (VOICE_BUILD_SERVER)
-    add_subdirectory(server)
 endif()
 
 

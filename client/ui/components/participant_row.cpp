@@ -1,6 +1,6 @@
 ﻿#include "participant_row.h"
 
-#include "ui_helpers.h"
+#include "ui/components/ui_helpers.h"
 
 #include <QCheckBox>
 #include <QLabel>

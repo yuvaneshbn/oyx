@@ -1,15 +1,20 @@
 ﻿set(CLIENT_SOURCES
-    main.cpp
-    main_window.cpp
-    participant_row.cpp
-    settings_dialog.cpp
-    startup_dialog.cpp
-    volume_control_panel.cpp
-    audio_engine.cpp
-    echo_canceller.cpp
-    network_discovery.cpp
-    control_client.cpp
-    ui_helpers.cpp
+    app/main.cpp
+    audio/audio_engine.cpp
+    audio/aec_processor.cpp
+    net/control_client.cpp
+    net/network_discovery.cpp
+    server/voice_server.cpp
+    p2p/multi_sfu_manager.cpp
+    p2p/peer_discovery.cpp
+    p2p/distributed_sfu_manager.cpp
+    p2p/rtp_transport.cpp
+    ui/main_window.cpp
+    ui/volume_control_panel.cpp
+    ui/components/participant_row.cpp
+    ui/components/settings_dialog.cpp
+    ui/components/startup_dialog.cpp
+    ui/components/ui_helpers.cpp
 )
 
 add_executable(voice_client ${CLIENT_SOURCES})
@@ -24,21 +29,17 @@ target_link_libraries(voice_client PRIVATE
     Qt6::Widgets
     Qt6::UiTools
     voice_shared
+    webrtc-audio-processing::webrtc-audio-processing
     ws2_32
     winmm
 )
-
-if (TARGET native_mixer)
-    target_link_libraries(voice_client PRIVATE native_mixer)
-    target_compile_definitions(voice_client PRIVATE VOICE_HAVE_NATIVE_MIXER=1)
-else()
-    target_compile_definitions(voice_client PRIVATE VOICE_HAVE_NATIVE_MIXER=0)
-endif()
 
 target_compile_definitions(voice_client PRIVATE
     NOMINMAX
     VOICE_PORTAUDIO_DLL_FALLBACK="${PORTAUDIO_DLL}"
 )
+
+set(VOICE_VCPKG_BIN "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
 
 set(QT_DEPLOY_TOOL "")
 if (WINDEPLOYQT_EXECUTABLE AND EXISTS "${WINDEPLOYQT_EXECUTABLE}")
@@ -64,9 +65,18 @@ add_custom_command(TARGET voice_client POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${PORTAUDIO_DLL}
         $<TARGET_FILE_DIR:voice_client>/libportaudio.dll
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${VOICE_VCPKG_BIN}/webrtc-audio-processing-1-3.dll
+        $<TARGET_FILE_DIR:voice_client>/webrtc-audio-processing-1-3.dll
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${VOICE_VCPKG_BIN}/webrtc-audio-coding-1-3.dll
+        $<TARGET_FILE_DIR:voice_client>/webrtc-audio-coding-1-3.dll
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${VOICE_VCPKG_BIN}/abseil_dll.dll
+        $<TARGET_FILE_DIR:voice_client>/abseil_dll.dll
 )
 
-if (WIN32 AND EXISTS "${QT_DEPLOY_TOOL}")
+if (VOICE_RUN_QT_DEPLOY AND WIN32 AND EXISTS "${QT_DEPLOY_TOOL}")
     add_custom_command(TARGET voice_client POST_BUILD
         COMMAND "${QT_DEPLOY_TOOL}"
             --no-compiler-runtime

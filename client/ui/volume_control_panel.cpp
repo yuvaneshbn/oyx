@@ -1,7 +1,7 @@
 ﻿#include "volume_control_panel.h"
 
-#include "audio_engine.h"
-#include "ui_helpers.h"
+#include "audio/audio_engine.h"
+#include "ui/components/ui_helpers.h"
 
 #include <QCheckBox>
 #include <QLabel>

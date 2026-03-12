@@ -1,8 +1,9 @@
 #include "audio_engine.h"
 
-#include "../shared/socket_utils.h"
-#include "echo_canceller.h"
+#include "audio_packet.h"
+#include "socket_utils.h"
 #include "portaudio_dyn.h"
+#include "aec_processor.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,7 +18,6 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
-#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -380,20 +380,19 @@ AudioEngine::AudioEngine()
         port_ = ntohs(name.sin_port);
     }
 
-    if (echo_cancel_available()) {
-        try {
-            echo_ = new EchoCanceller(RATE, 1, FRAME, 80);
-            echo_available_ = true;
-            std::cout << "[AUDIO] Native echo cancellation available (disabled by default)\n";
-        } catch (const std::exception& ex) {
-            echo_available_ = false;
-            std::cout << "[AUDIO] Native echo cancellation unavailable: " << ex.what() << "\n";
-        } catch (...) {
-            echo_available_ = false;
-            std::cout << "[AUDIO] Native echo cancellation unavailable\n";
+    echo_enabled_.store(false);
+
+    try {
+        aec_ = std::make_unique<AecProcessor>(RATE, FRAME);
+        if (aec_ && aec_->available()) {
+            echo_enabled_.store(false);
+            std::cout << "[AUDIO] WebRTC AEC3 available (disabled by default)\n";
+        } else {
+            aec_.reset();
         }
-    } else {
-        std::cout << "[AUDIO] Native echo cancellation API not found in native_mixer.dll\n";
+    } catch (...) {
+        aec_.reset();
+        std::cout << "[AUDIO] WebRTC AEC3 unavailable\n";
     }
 
     if (!openOutput()) {
@@ -417,9 +416,14 @@ std::vector<AudioDeviceInfo> AudioEngine::listOutputDevices() const {
 
 bool AudioEngine::setInputDevice(int device_index) {
     input_device_index_ = device_index;
-    if (running_.load() && !server_ip_.empty()) {
+    std::vector<std::string> destinations;
+    {
+        std::lock_guard<std::mutex> lock(routing_mutex_);
+        destinations = send_destinations_;
+    }
+    if (running_.load() && !destinations.empty()) {
         stop();
-        return start(server_ip_);
+        return start(destinations);
     }
     return true;
 }
@@ -467,7 +471,32 @@ void AudioEngine::setAutoGain(bool enabled) {
 
 void AudioEngine::setEchoEnabled(bool enabled) {
     std::lock_guard<std::mutex> lock(echo_mutex_);
-    echo_enabled_.store(enabled && echo_ != nullptr);
+    echo_enabled_.store(enabled && aec_ != nullptr);
+}
+
+void AudioEngine::setEchoDelayMs(int delay_ms) {
+    std::lock_guard<std::mutex> lock(echo_mutex_);
+    if (aec_) {
+        aec_->set_delay_ms(delay_ms);
+        std::cout << "[AUDIO] Auto-set echo delay to " << delay_ms << " ms\n";
+    }
+}
+
+void AudioEngine::resetEchoCanceller(int initial_delay_ms) {
+    std::lock_guard<std::mutex> lock(echo_mutex_);
+
+    const bool was_enabled = echo_enabled_.load();
+
+    try {
+        aec_ = std::make_unique<AecProcessor>(RATE, FRAME);
+        aec_->set_delay_ms(initial_delay_ms);
+        echo_enabled_.store(was_enabled);
+        std::cout << "[AUDIO] AEC reset with delay " << initial_delay_ms << " ms (SFU role changed)\n";
+    } catch (...) {
+        aec_.reset();
+        echo_enabled_.store(false);
+        std::cerr << "[AUDIO] Failed to recreate AEC\n";
+    }
 }
 
 void AudioEngine::setTxMuted(bool enabled) {
@@ -655,45 +684,21 @@ void AudioEngine::listenLoop() {
 }
 
 void AudioEngine::handleIncomingPacket(const std::vector<uint8_t>& data) {
-    if (data.empty()) {
+    const auto packet = parse_voice_packet(data);
+    if (!packet.has_value() || packet->payload.empty()) {
         return;
     }
 
-    const std::string_view payload(reinterpret_cast<const char*>(data.data()), data.size());
-    std::vector<uint8_t> opus;
-
-    if (payload.rfind("MIXED|", 0) == 0) {
-        const auto second = payload.find('|', 6);
-        if (second == std::string_view::npos) {
-            return;
-        }
-        const size_t start = second + 1;
-        opus.assign(data.begin() + static_cast<long long>(start), data.end());
-    } else {
-        const auto colon = payload.find(':');
-        if (colon != std::string_view::npos) {
-            std::string header(payload.substr(0, colon));
-            const auto pipe = header.find('|');
-            if (pipe != std::string::npos) {
-                std::string sender = header.substr(0, pipe);
-                if (!sender.empty() && sender == client_id_) {
-                    return;
-                }
-            }
-            opus.assign(data.begin() + static_cast<long long>(colon + 1), data.end());
-        } else {
-            opus.assign(data.begin(), data.end());
-        }
-    }
-
-    if (opus.empty()) {
+    if (packet->kind == VoicePacketKind::ClientAudio &&
+        !packet->sender_id.empty() &&
+        packet->sender_id == client_id_) {
         return;
     }
 
     std::vector<int16_t> pcm;
     {
         std::lock_guard<std::mutex> lock(decoder_mutex_);
-        pcm = decoder_.decode(opus);
+        pcm = decoder_.decode(packet->payload);
     }
     if (pcm.empty()) {
         return;
@@ -743,11 +748,11 @@ std::vector<int16_t> AudioEngine::mixFrame() {
         }
     }
 
-    if (echo_enabled_.load()) {
+    if (echo_enabled_.load() && aec_) {
         try {
             std::lock_guard<std::mutex> lock(echo_mutex_);
-            if (echo_enabled_.load() && echo_ != nullptr) {
-                echo_->processReverse(frame.data(), static_cast<int>(frame.size()));
+            if (echo_enabled_.load() && aec_) {
+                aec_->process_render(frame.data(), static_cast<int>(frame.size()));
             }
         } catch (...) {
             std::cerr << "[AUDIO] Echo reverse error, disabling echo canceller\n";
@@ -814,14 +819,29 @@ bool AudioEngine::popCaptureFrame(std::vector<int16_t>& out) {
 }
 
 bool AudioEngine::start(const std::string& server_ip) {
+    return start(std::vector<std::string>{server_ip});
+}
+
+bool AudioEngine::start(const std::vector<std::string>& destinations) {
     if (client_id_.empty()) {
         return false;
     }
     if (running_.load()) {
         return true;
     }
+    if (destinations.empty()) {
+        return false;
+    }
 
-    server_ip_ = server_ip;
+    {
+        std::lock_guard<std::mutex> lock(routing_mutex_);
+        send_destinations_ = destinations;
+    }
+    transport_.setDestinations(destinations);
+    if (!transport_.hasDestinations()) {
+        return false;
+    }
+
     if (!openInput()) {
         std::cerr << "[AUDIO] Failed to start capture\n";
         return false;
@@ -839,16 +859,31 @@ bool AudioEngine::start(const std::string& server_ip) {
     running_.store(true);
     send_thread_ = std::thread(&AudioEngine::sendLoop, this);
 
-    std::cout << "[AUDIO] Audio capture ACTIVE for " << client_id_ << " -> " << server_ip_ << ":" << AUDIO_PORT << "\n";
+    auto active_destinations = transport_.destinations();
+    std::cout << "[AUDIO] Audio capture ACTIVE for " << client_id_ << " -> ";
+    for (size_t i = 0; i < active_destinations.size(); ++i) {
+        if (i > 0) {
+            std::cout << ", ";
+        }
+        std::cout << active_destinations[i] << ":" << AUDIO_PORT;
+    }
+    std::cout << "\n";
     return true;
 }
 
-void AudioEngine::sendLoop() {
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(static_cast<u_short>(AUDIO_PORT));
-    inet_pton(AF_INET, server_ip_.c_str(), &dest.sin_addr);
+bool AudioEngine::updateDestinations(const std::vector<std::string>& destinations) {
+    if (destinations.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(routing_mutex_);
+        send_destinations_ = destinations;
+    }
+    transport_.setDestinations(destinations);
+    return transport_.hasDestinations();
+}
 
+void AudioEngine::sendLoop() {
     int packet_count = 0;
 
     while (running_.load()) {
@@ -879,7 +914,7 @@ void AudioEngine::sendLoop() {
             mic_sensitivity = mic_sensitivity_;
             auto_gain = auto_gain_;
         }
-        echo_enabled = echo_enabled_.load();
+        echo_enabled = false;
 
         capture_level_.store(std::min(100, (input_peak * 100) / 32767));
         const int activity_threshold = std::max(120, 2200 - (mic_sensitivity * 16));
@@ -888,11 +923,11 @@ void AudioEngine::sendLoop() {
         if (tx_muted) {
             std::fill(frame.begin(), frame.end(), 0);
         } else {
-            if (echo_enabled && echo_ != nullptr) {
+            if (echo_enabled && aec_) {
                 try {
                     std::lock_guard<std::mutex> lock(echo_mutex_);
-                    if (echo_enabled_.load() && echo_ != nullptr) {
-                        frame = echo_->processCapture(frame.data(), static_cast<int>(frame.size()));
+                    if (echo_enabled_.load() && aec_) {
+                        aec_->process_capture(frame);
                     }
                 } catch (...) {
                     std::cerr << "[AUDIO] Echo capture error, disabling\n";
@@ -935,20 +970,17 @@ void AudioEngine::sendLoop() {
             continue;
         }
 
-        std::string header = client_id_ + "|" + std::to_string(seq_) + "|" + std::to_string(timestamp_);
-        std::vector<uint8_t> packet;
-        packet.reserve(header.size() + 1 + opus.size());
-        packet.insert(packet.end(), header.begin(), header.end());
-        packet.push_back(':');
-        packet.insert(packet.end(), opus.begin(), opus.end());
+        std::vector<uint8_t> packet = build_client_audio_packet(client_id_, seq_, timestamp_, opus);
 
         seq_ = static_cast<uint16_t>((seq_ + 1) & 0xFFFF);
         timestamp_ += FRAME;
 
-        sendto(send_sock_, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
-        ++packet_count;
-        if (packet_count % 100 == 0) {
-            std::cout << "[AUDIO] Sent " << packet_count << " packets from " << client_id_ << "\n";
+        const int sent = transport_.sendPacket(send_sock_, packet);
+        if (sent > 0) {
+            ++packet_count;
+            if (packet_count % 100 == 0) {
+                std::cout << "[AUDIO] Sent " << packet_count << " packets from " << client_id_ << "\n";
+            }
         }
     }
 }
@@ -969,6 +1001,12 @@ void AudioEngine::stop() {
         closesocket(send_sock_);
         send_sock_ = INVALID_SOCKET;
     }
+
+    {
+        std::lock_guard<std::mutex> lock(routing_mutex_);
+        send_destinations_.clear();
+    }
+    transport_.setDestinations({});
 }
 
 void AudioEngine::shutdown() {
@@ -987,8 +1025,6 @@ void AudioEngine::shutdown() {
 
     {
         std::lock_guard<std::mutex> lock(echo_mutex_);
-        delete echo_;
-        echo_ = nullptr;
         echo_enabled_.store(false);
     }
 

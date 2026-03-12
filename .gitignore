@@ -5,3 +5,5 @@ build-mingw/
 *.suo
 *.VC.db
 *.VC.opendb
+vcpkg_installed/
+webrtc-audio-processing-1.3.tar.gz

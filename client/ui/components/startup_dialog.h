@@ -31,9 +31,6 @@ protected:
     void accept() override;
 
 private:
-    bool isNameAvailable(const QString& candidate);
-    static QStringList parseListResponse(const QString& response);
-
     QString server_ip_;
     int audio_port_ = 0;
     QLineEdit* name_input_ = nullptr;

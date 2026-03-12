@@ -1,6 +1,6 @@
 ﻿#include "control_client.h"
 
-#include "../shared/socket_utils.h"
+#include "socket_utils.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>

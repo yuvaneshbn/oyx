@@ -7,6 +7,8 @@
 #include <QTimer>
 
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <thread>
 
 class AudioEngine;
@@ -32,6 +34,7 @@ public:
                const QString& register_secret,
                QWidget* parent = nullptr);
     ~MainWindow() override;
+    void onSfuChanged(const QString& sfu_ip, bool self_sfu);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -49,6 +52,11 @@ private:
     void toggleSelfMute(bool muted);
     void updateLiveUi();
     void handleHeartbeat(bool alive);
+    void attemptReconnect();
+
+    std::string serverIpStd() const;
+    QString serverIp() const;
+    void setServerIp(const QString& server_ip);
 
     bool reconnectToServer(QString& message);
     void heartbeatLoop();
@@ -57,6 +65,7 @@ private:
 
     QString my_id_;
     QString server_ip_;
+    mutable std::mutex server_mutex_;
     QString register_secret_;
     AudioEngine* audio_ = nullptr;
 
@@ -103,6 +112,7 @@ private:
     QTimer stop_capture_timer_;
     QTimer ui_timer_;
     QTimer auto_refresh_timer_;
+    QTimer reconnect_timer_;
 };
 
 #endif

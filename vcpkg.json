@@ -1,0 +1,8 @@
+{
+  "name": "voice-two-way",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "webrtc-audio-processing",
+    "opus"
+  ]
+}

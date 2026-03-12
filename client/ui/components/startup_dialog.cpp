@@ -1,7 +1,5 @@
 ﻿#include "startup_dialog.h"
 
-#include "control_client.h"
-
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
@@ -9,8 +7,6 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QVBoxLayout>
-
-// No additional networking needed here; control checks handled via send_control_command.
 
 ServerIPDialog::ServerIPDialog(QWidget* parent)
     : QDialog(parent) {
@@ -49,7 +45,7 @@ StartupDialog::StartupDialog(const QString& server_ip, int audio_port, QWidget* 
     setFixedSize(400, 200);
 
     auto* layout = new QVBoxLayout(this);
-    layout->addWidget(new QLabel(QString("Server: %1").arg(server_ip_)));
+    layout->addWidget(new QLabel(QString("SFU: %1").arg(server_ip_)));
     layout->addWidget(new QLabel(QString("Audio Port: %1").arg(audio_port_)));
     layout->addWidget(new QLabel("Enter your unique name:"));
 
@@ -82,30 +78,6 @@ void StartupDialog::accept() {
         return;
     }
 
-    if (!isNameAvailable(candidate)) {
-        QMessageBox::warning(this, "Name Already In Use", QString("'%1' is already connected.\nPlease choose a different name.").arg(candidate));
-        return;
-    }
-
     client_id_ = candidate;
     QDialog::accept();
-}
-
-bool StartupDialog::isNameAvailable(const QString& candidate) {
-    const auto resp = send_control_command(server_ip_.toStdString(), "LIST", 2500);
-    if (!resp.ok) {
-        return true;
-    }
-    const QStringList existing = parseListResponse(QString::fromStdString(resp.response));
-    return !existing.contains(candidate);
-}
-
-QStringList StartupDialog::parseListResponse(const QString& response) {
-    if (response.isEmpty()) {
-        return {};
-    }
-    if (response.contains('\n')) {
-        return response.split('\n', Qt::SkipEmptyParts);
-    }
-    return response.split(',', Qt::SkipEmptyParts);
 }

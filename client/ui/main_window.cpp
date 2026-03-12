@@ -1,10 +1,10 @@
 ﻿#include "main_window.h"
 
-#include "audio_engine.h"
-#include "control_client.h"
-#include "participant_row.h"
-#include "settings_dialog.h"
-#include "ui_helpers.h"
+#include "audio/audio_engine.h"
+#include "net/control_client.h"
+#include "ui/components/participant_row.h"
+#include "ui/components/settings_dialog.h"
+#include "ui/components/ui_helpers.h"
 #include "volume_control_panel.h"
 
 #include <QCheckBox>
@@ -61,9 +61,9 @@ MainWindow::MainWindow(const QString& my_id,
                        QWidget* parent)
     : QMainWindow(parent),
       my_id_(my_id),
-      server_ip_(server_ip),
       register_secret_(register_secret),
       audio_(audio) {
+    setServerIp(server_ip);
     audio_->setClientId(my_id_.toStdString());
 
     root_ = load_ui_widget(ui_path("main_window.ui"), this);
@@ -128,7 +128,7 @@ MainWindow::MainWindow(const QString& my_id,
     connect(broadcast_button_, &QPushButton::toggled, this, &MainWindow::toggleBroadcast);
 
     connect(settings_button_, &QPushButton::clicked, this, [this]() {
-        SettingsDialog dlg(audio_, server_ip_, [this]() {
+        SettingsDialog dlg(audio_, serverIp(), [this]() {
             QString message;
             bool ok = reconnectToServer(message);
             return std::make_pair(ok, message);
@@ -148,11 +148,15 @@ MainWindow::MainWindow(const QString& my_id,
     connect(&auto_refresh_timer_, &QTimer::timeout, this, [this]() { refreshParticipants(true); });
     auto_refresh_timer_.start();
 
+    reconnect_timer_.setInterval(1500);
+    reconnect_timer_.setSingleShot(true);
+    connect(&reconnect_timer_, &QTimer::timeout, this, &MainWindow::attemptReconnect);
+
     system_level_bar_->setMinimum(0);
     system_level_bar_->setMaximum(100);
     system_level_bar_->setValue(0);
 
-    main_status_bar_->showMessage(QString("Client %1 connected to %2").arg(my_id_, server_ip_));
+    main_status_bar_->showMessage(QString("Client %1 connected to %2").arg(my_id_, serverIp()));
     setConnectedState(true);
 
     refreshParticipants(false);
@@ -161,6 +165,67 @@ MainWindow::MainWindow(const QString& my_id,
 
 MainWindow::~MainWindow() {
     cleanup(true);
+}
+
+std::string MainWindow::serverIpStd() const {
+    std::lock_guard<std::mutex> lock(server_mutex_);
+    return server_ip_.toStdString();
+}
+
+QString MainWindow::serverIp() const {
+    std::lock_guard<std::mutex> lock(server_mutex_);
+    return server_ip_;
+}
+
+void MainWindow::setServerIp(const QString& server_ip) {
+    std::lock_guard<std::mutex> lock(server_mutex_);
+    server_ip_ = server_ip;
+}
+
+void MainWindow::onSfuChanged(const QString& sfu_ip, bool self_sfu) {
+    if (cleaned_up_) {
+        return;
+    }
+    if (sfu_ip.isEmpty()) {
+        return;
+    }
+
+    const QString current = serverIp();
+    if (current == sfu_ip) {
+        return;
+    }
+
+    setServerIp(sfu_ip);
+    main_status_bar_->showMessage(QString("SFU changed to %1").arg(sfu_ip));
+
+    // === FULLY AUTOMATIC ECHO FIX ===
+    const int delay_ms = self_sfu ? 30 : 100;
+    audio_->resetEchoCanceller(delay_ms);
+
+    if (audio_->isRunning()) {
+        audio_->updateDestinations({sfu_ip.toStdString()});
+    }
+
+    if (!reconnect_timer_.isActive()) {
+        attemptReconnect();
+    }
+
+    if (self_sfu) {
+        std::cout << "[CLIENT] Acting as SFU leader\n";
+    }
+}
+
+void MainWindow::attemptReconnect() {
+    if (cleaned_up_) {
+        return;
+    }
+    QString message;
+    if (reconnectToServer(message)) {
+        setConnectedState(true, QString("Connected to SFU %1").arg(serverIp()));
+        return;
+    }
+    setConnectedState(false, message.isEmpty() ? "Reconnect failed" : message);
+    reconnect_timer_.start();
 }
 
 void MainWindow::setConnectedState(bool connected, const QString& detail) {
@@ -175,14 +240,14 @@ void MainWindow::setConnectedState(bool connected, const QString& detail) {
     } else {
         connection_indicator_->setText("Disconnected");
         connection_indicator_->setStyleSheet("color:#C62828; font-weight:bold;");
-        QString message = detail.isEmpty() ? "Server unreachable" : detail;
+        QString message = detail.isEmpty() ? "SFU unreachable" : detail;
         warning_label_->setText(message);
         main_status_bar_->showMessage(message);
     }
 }
 
 void MainWindow::refreshParticipants(bool silent) {
-    const auto resp = send_control_command(server_ip_.toStdString(), "LIST:" + my_id_.toStdString());
+    const auto resp = send_control_command(serverIpStd(), "LIST:" + my_id_.toStdString());
     if (!resp.ok) {
         if (!silent) {
             setConnectedState(false, QString("Refresh failed: %1").arg(QString::fromStdString(resp.response)));
@@ -264,6 +329,20 @@ void MainWindow::refreshParticipants(bool silent) {
         participant_rows_.insert(cid, row);
     }
 
+    // Auto-broadcast to all peers by default in distributed SFU mode.
+    QSet<QString> auto_targets = participant_set;
+    auto_targets.remove(my_id_);
+    if (!auto_targets.isEmpty() && auto_targets != targets_) {
+        targets_ = auto_targets;
+        for (auto it = participant_rows_.begin(); it != participant_rows_.end(); ++it) {
+            if (it.key() == my_id_) {
+                continue;
+            }
+            it.value()->setTalkChecked(true);
+        }
+        updateTargets();
+    }
+
     recomputeHearTargets();
     updateHearTargets();
     syncBroadcastButton();
@@ -306,7 +385,7 @@ void MainWindow::updateHearTargets() {
         return sortClientKey(a) < sortClientKey(b);
     });
     const QString payload = hear_list.join(",");
-    const auto resp = send_control_command(server_ip_.toStdString(), "HEAR:" + my_id_.toStdString() + ":" + payload.toStdString());
+    const auto resp = send_control_command(serverIpStd(), "HEAR:" + my_id_.toStdString() + ":" + payload.toStdString());
     if (resp.ok && resp.response == "OK") {
         setConnectedState(true);
     } else {
@@ -315,12 +394,17 @@ void MainWindow::updateHearTargets() {
 }
 
 void MainWindow::updateTargets() {
-    if (!targets_.isEmpty() && !audio_->isRunning()) {
+    if (!targets_.isEmpty()) {
         if (stop_capture_timer_.isActive()) {
             stop_capture_timer_.stop();
         }
-        audio_->start(server_ip_.toStdString());
-    } else if (targets_.isEmpty() && audio_->isRunning() && !stop_capture_timer_.isActive()) {
+        const auto ip = serverIpStd();
+        if (!audio_->isRunning()) {
+            audio_->start(ip);
+        } else {
+            audio_->updateDestinations({ip});
+        }
+    } else if (audio_->isRunning() && !stop_capture_timer_.isActive()) {
         stop_capture_timer_.start();
     }
 
@@ -329,7 +413,7 @@ void MainWindow::updateTargets() {
         return sortClientKey(a) < sortClientKey(b);
     });
     const QString payload = target_list.join(",");
-    const auto resp = send_control_command(server_ip_.toStdString(), "TARGETS:" + my_id_.toStdString() + ":" + payload.toStdString());
+    const auto resp = send_control_command(serverIpStd(), "TARGETS:" + my_id_.toStdString() + ":" + payload.toStdString());
     if (resp.ok && resp.response == "OK") {
         setConnectedState(true);
     } else {
@@ -471,13 +555,13 @@ void MainWindow::handleHeartbeat(bool alive) {
     } else {
         ++heartbeat_failures_;
         if (heartbeat_failures_ >= 2) {
-            setConnectedState(false, "Disconnected from server");
+            setConnectedState(false, "Disconnected from SFU");
         }
     }
 }
 
 bool MainWindow::reconnectToServer(QString& message) {
-    auto ping = send_control_command(server_ip_.toStdString(), "PING:" + my_id_.toStdString(), 3000);
+    auto ping = send_control_command(serverIpStd(), "PING:" + my_id_.toStdString(), 3000);
     if (ping.ok && ping.response == "OK") {
         setConnectedState(true, "Connection healthy");
         refreshParticipants(false);
@@ -485,7 +569,10 @@ bool MainWindow::reconnectToServer(QString& message) {
         return true;
     }
 
-    auto reg = send_control_command(server_ip_.toStdString(), "REGISTER:" + my_id_.toStdString() + ":" + std::to_string(audio_->port()) + ":" + register_secret_.toStdString(), 5000);
+    auto reg = send_control_command(serverIpStd(),
+                                    "REGISTER:" + my_id_.toStdString() + ":" + std::to_string(audio_->port()) + ":" +
+                                        register_secret_.toStdString(),
+                                    5000);
     if (!reg.ok) {
         setConnectedState(false, QString("Reconnect failed: %1").arg(QString::fromStdString(reg.response)));
         message = QString::fromStdString(reg.response);
@@ -499,21 +586,25 @@ bool MainWindow::reconnectToServer(QString& message) {
     }
 
     std::string multicast;
-    if (!join_room(server_ip_.toStdString(), my_id_.toStdString(), multicast)) {
+    if (!join_room(serverIpStd(), my_id_.toStdString(), multicast)) {
         setConnectedState(false, "Join failed");
         message = "Join failed";
         return false;
     }
 
-    setConnectedState(true, "Reconnected to server");
+    setConnectedState(true, "Reconnected to SFU");
     refreshParticipants(false);
+    updateTargets();
     message = "Re-registered and joined room main.";
+    if (audio_->isRunning()) {
+        audio_->updateDestinations({serverIpStd()});
+    }
     return true;
 }
 
 void MainWindow::heartbeatLoop() {
     while (!hb_stop_.load()) {
-        const auto resp = send_control_command(server_ip_.toStdString(), "PING:" + my_id_.toStdString(), 3000);
+        const auto resp = send_control_command(serverIpStd(), "PING:" + my_id_.toStdString(), 3000);
         const bool alive = resp.ok && resp.response == "OK";
         QMetaObject::invokeMethod(this, [this, alive]() { handleHeartbeat(alive); }, Qt::QueuedConnection);
         for (int i = 0; i < 80 && !hb_stop_.load(); ++i) {
@@ -538,13 +629,16 @@ void MainWindow::cleanup(bool unregister) {
     if (stop_capture_timer_.isActive()) {
         stop_capture_timer_.stop();
     }
+    if (reconnect_timer_.isActive()) {
+        reconnect_timer_.stop();
+    }
 
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
 
     if (unregister && !unregistered_) {
-        send_control_command(server_ip_.toStdString(), "UNREGISTER:" + my_id_.toStdString());
+        send_control_command(serverIpStd(), "UNREGISTER:" + my_id_.toStdString());
         unregistered_ = true;
     }
 

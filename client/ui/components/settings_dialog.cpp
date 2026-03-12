@@ -1,8 +1,8 @@
 ﻿#include "settings_dialog.h"
 
-#include "audio_engine.h"
-#include "ui_helpers.h"
-#include "volume_control_panel.h"
+#include "audio/audio_engine.h"
+#include "ui/components/ui_helpers.h"
+#include "ui/volume_control_panel.h"
 
 #include <QComboBox>
 #include <QLabel>

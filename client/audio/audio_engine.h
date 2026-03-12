@@ -1,7 +1,8 @@
 ﻿#ifndef AUDIO_ENGINE_H
 #define AUDIO_ENGINE_H
 
-#include "../shared/opus_codec.h"
+#include "opus_codec.h"
+#include "p2p/rtp_transport.h"
 
 #include <algorithm>
 #include <atomic>
@@ -21,7 +22,7 @@ struct AudioDeviceInfo {
     std::string name;
 };
 
-class EchoCanceller;
+class AecProcessor;
 
 class AudioEngine {
 public:
@@ -29,6 +30,8 @@ public:
     ~AudioEngine();
 
     bool start(const std::string& server_ip);
+    bool start(const std::vector<std::string>& destinations);
+    bool updateDestinations(const std::vector<std::string>& destinations);
     void stop();
     void shutdown();
 
@@ -50,6 +53,8 @@ public:
     void setNoiseSuppressionEnabled(bool enabled);
     void setAutoGain(bool enabled);
     void setEchoEnabled(bool enabled);
+    void setEchoDelayMs(int delay_ms);
+    void resetEchoCanceller(int initial_delay_ms);
     void setTxMuted(bool enabled);
 
     int testMicrophoneLevel(double duration_sec = 1.0);
@@ -62,7 +67,7 @@ public:
     float mixedPeak() const { return mixed_peak_.load(); }
 
     bool isRunning() const { return running_.load(); }
-    bool echoAvailable() const { return echo_available_; }
+    bool echoAvailable() const { return aec_ != nullptr; }
     bool echoEnabled() const { return echo_enabled_.load(); }
     bool isTxMuted() const;
 
@@ -88,7 +93,8 @@ private:
 
     int port_ = 0;
     std::string client_id_;
-    std::string server_ip_;
+    std::vector<std::string> send_destinations_;
+    mutable std::mutex routing_mutex_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> listen_running_{true};
@@ -104,21 +110,20 @@ private:
     std::atomic<int> capture_level_{0};
     std::atomic<bool> capture_active_{false};
     std::atomic<float> mixed_peak_{0.0f};
-    bool echo_available_ = false;
 
     float master_volume_ = 1.0f;
     float output_volume_ = 1.0f;
     float tx_gain_db_ = 0.0f;
     int mic_sensitivity_ = 50;
-    int noise_suppression_ = 0;
-    bool noise_suppression_enabled_ = false;
+    int noise_suppression_ = 30;
+    bool noise_suppression_enabled_ = true;
     bool auto_gain_ = false;
     std::atomic<bool> echo_enabled_{false};
 
     bool tx_muted_ = false;
     mutable std::mutex config_mutex_;
 
-    EchoCanceller* echo_ = nullptr;
+    std::unique_ptr<AecProcessor> aec_;
     std::mutex echo_mutex_;
 
     OpusCodec encoder_;
@@ -137,6 +142,7 @@ private:
 
     SOCKET recv_sock_ = INVALID_SOCKET;
     SOCKET send_sock_ = INVALID_SOCKET;
+    RTPTransport transport_;
 
     void* wave_out_ = nullptr;
     void* wave_in_ = nullptr;

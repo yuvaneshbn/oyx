@@ -1,5 +1,6 @@
 ﻿#include "voice_server.h"
 
+#include "../shared/audio_packet.h"
 #include "../shared/opus_codec.h"
 #include "../shared/socket_utils.h"
 
@@ -39,7 +40,7 @@ constexpr int MIX_FRAME_SAMPLES = 320;
 constexpr int MIX_FRAME_BYTES = MIX_FRAME_SAMPLES * 2;
 constexpr double ROOM_SOURCE_STALE_SEC = 0.25;
 constexpr int ROOM_MIX_QUEUE_MAX = 128;
-constexpr int VAD_PEAK_THRESHOLD = 120;
+constexpr int VAD_PEAK_THRESHOLD = 180;
 
 std::string normalize_client_id(const std::string& id) {
     std::string out = id;
@@ -713,10 +714,13 @@ private:
     }
 
     void processAudioPacket(const std::vector<uint8_t>& packet, const sockaddr_in& addr) {
-        const std::string sender_id = extractSenderId(packet);
-        if (sender_id.empty()) {
+        (void)addr;
+
+        const auto parsed = parse_voice_packet(packet);
+        if (!parsed.has_value() || parsed->kind != VoicePacketKind::ClientAudio || parsed->sender_id.empty()) {
             return;
         }
+        const std::string& sender_id = parsed->sender_id;
 
         std::string room_id;
         bool can_mix = false;
@@ -734,15 +738,14 @@ private:
             return;
         }
 
-        const std::vector<uint8_t> opus_payload = extractOpusPayload(packet);
-        if (opus_payload.empty()) {
+        if (parsed->payload.empty()) {
             return;
         }
 
         std::shared_ptr<OpusCodec> decoder = getOrCreateDecoder(sender_id);
         std::vector<int16_t> pcm;
         try {
-            pcm = decoder->decode(opus_payload);
+            pcm = decoder->decode(parsed->payload);
         } catch (...) {
             return;
         }
@@ -757,31 +760,6 @@ private:
 
         auto mixer = getOrCreateMixer(room_id);
         mixer->addPcm(sender_id, pcm);
-    }
-
-    std::string extractSenderId(const std::vector<uint8_t>& packet) {
-        if (packet.empty()) {
-            return {};
-        }
-        auto it = std::find(packet.begin(), packet.end(), ':');
-        if (it == packet.end()) {
-            return {};
-        }
-        std::string header(packet.begin(), it);
-        auto pipe = header.find('|');
-        if (pipe == std::string::npos) {
-            return {};
-        }
-        std::string sender = header.substr(0, pipe);
-        return sender;
-    }
-
-    std::vector<uint8_t> extractOpusPayload(const std::vector<uint8_t>& packet) {
-        auto it = std::find(packet.begin(), packet.end(), ':');
-        if (it == packet.end()) {
-            return {};
-        }
-        return std::vector<uint8_t>(it + 1, packet.end());
     }
 
     std::shared_ptr<OpusCodec> getOrCreateDecoder(const std::string& sender_id) {
@@ -898,11 +876,7 @@ private:
                         if (opus.empty()) {
                             continue;
                         }
-                        std::string header = "MIXED|" + std::to_string(frame.seq) + "|";
-                        std::vector<uint8_t> packet;
-                        packet.reserve(header.size() + opus.size());
-                        packet.insert(packet.end(), header.begin(), header.end());
-                        packet.insert(packet.end(), opus.begin(), opus.end());
+                        std::vector<uint8_t> packet = build_mixed_audio_packet(frame.seq, opus);
                         sendto(udp_sock_, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
                     }
                 }
