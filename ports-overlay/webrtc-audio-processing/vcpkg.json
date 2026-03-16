@@ -1,0 +1,11 @@
+{
+  "name": "webrtc-audio-processing",
+  "version": "1.3",
+  "homepage": "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing",
+  "description": "Standalone WebRTC AudioProcessing (AEC3, NS, AGC) from freedesktop",
+  "license": "BSD-3-Clause",
+  "supports": "windows & !uwp",
+  "dependencies": [
+    "abseil"
+  ]
+}
